@@ -1,0 +1,1799 @@
+#single_sample_explain.py
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+from PIL import Image
+
+import torch
+import torch.nn as nn
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap
+
+plt.rcParams["axes.unicode_minus"] = False
+
+try:
+    import shap  # type: ignore
+except Exception:
+    shap = None
+
+
+# =========================================================
+# 项目根目录探测
+# =========================================================
+def project_setup() -> Path:
+    here = Path(__file__).resolve()
+    candidates = [here.parent, here.parent.parent, Path.cwd()]
+    for cand in candidates:
+        if (cand / "utils").exists() and (cand / "models").exists():
+            if str(cand) not in sys.path:
+                sys.path.insert(0, str(cand))
+            return cand
+    cwd = Path.cwd()
+    if str(cwd) not in sys.path:
+        sys.path.insert(0, str(cwd))
+    return cwd
+
+
+PROJECT_ROOT = project_setup()
+
+import utils.config as cfg  # noqa: E402
+from utils.config import ModelConfig, denormalize_score  # noqa: E402
+from models.full_model import FullAestheticModel  # noqa: E402
+
+try:
+    from utils.data_loader import AestheticFeatureDataset  # noqa: E402
+except Exception:
+    AestheticFeatureDataset = None
+
+
+# =========================================================
+# 常量
+# =========================================================
+DEFAULT_REGION_NAMES = [
+    "background", "face", "sky", "building", "vegetation", "water", "object", "noise"
+]
+
+META_FEATURES = {"valid", "area_ratio"}
+
+REGION_CN = {
+    "background": "背景",
+    "face": "人脸",
+    "sky": "天空",
+    "building": "建筑",
+    "vegetation": "植被",
+    "water": "水体",
+    "object": "主体物",
+    "noise": "干扰区域",
+}
+
+FEATURE_CN = {
+    "edge_sharpness": "清晰度",
+    "nr_sharpness": "无参考清晰度",
+    "color_cast": "偏色质量",
+    "saturation": "饱和度",
+    "color_balance": "色彩均衡",
+    "over_exposure": "过曝质量",
+    "under_exposure": "欠曝质量",
+    "brightness_uniformity": "亮度均匀性",
+    "composition": "构图",
+    "symmetry": "对称度",
+    "texture": "纹理",
+    "contrast": "对比度",
+    "valid": "区域有效性",
+    "area_ratio": "面积占比",
+}
+
+REGION_EN = {
+    "background": "Background",
+    "face": "Face",
+    "sky": "Sky",
+    "building": "Building",
+    "vegetation": "Vegetation",
+    "water": "Water",
+    "object": "Object",
+    "noise": "Noise",
+}
+
+FEATURE_EN = {
+    "edge_sharpness": "Edge sharpness",
+    "nr_sharpness": "NR sharpness",
+    "color_cast": "Color cast",
+    "saturation": "Saturation",
+    "color_balance": "Color balance",
+    "over_exposure": "Over-exposure quality",
+    "under_exposure": "Under-exposure quality",
+    "brightness_uniformity": "Brightness uniformity",
+    "composition": "Composition",
+    "symmetry": "Symmetry",
+    "texture": "Texture",
+    "contrast": "Contrast",
+    "valid": "Region validity",
+    "area_ratio": "Area ratio",
+}
+
+# ===== unified paper-like fresh palette =====
+# Core blue-purple-pink family aligned with the beeswarm figures
+COLOR_LOW = "#2A7FDB"      # low-end blue
+COLOR_HIGH = "#D81B60"     # high-end pink
+COLOR_MID = "#8A56C5"      # transition purple
+FIG_BG = "#FFFFFF"         # user requested unified white background
+GRID_COLOR = "#CFCFD4"
+AXIS_COLOR = "#3F3F46"
+TEXT_COLOR = "#2E2E33"
+ZERO_LINE = "#8D8D94"
+
+# Bar-chart specific colors
+REGION_SCORE_BAR = "#AFCBE6"      # light blue for region sub-scores
+REGION_CONTRIB_POS = "#E55A8B"    # soft pink for positive contribution
+REGION_CONTRIB_NEG = "#7FAEDB"    # soft blue for negative contribution
+DEFECT_LINE = "#4C8ED9"           # defect threshold line
+LOW_VALUE_BAR = "#D8C9E8"         # pale purple for lowest-value bars
+
+# Backward-compatible aliases used elsewhere in the script
+COLOR_POS = REGION_CONTRIB_POS
+COLOR_NEG = REGION_CONTRIB_NEG
+COLOR_BG = FIG_BG
+COLOR_FIG = FIG_BG
+COLOR_SOFT_NEG = REGION_SCORE_BAR
+MASK_ALPHA = 0.80
+MASK_EDGE_ALPHA = 0.95
+
+PAPER_DIV_CMAP = LinearSegmentedColormap.from_list(
+    "paper_div", [COLOR_LOW, COLOR_MID, COLOR_HIGH]
+)
+PAPER_SEQ_CMAP = LinearSegmentedColormap.from_list(
+    "paper_seq", ["#FFFFFF", "#D9E7F6", "#C4B0E0", COLOR_HIGH]
+)
+
+# Harmonized semantic colors: all masks stay in one soft paper palette family.
+MASK_PALETTE = {
+    "background": "#8AA7C4",
+    "face": "#E2A37E",
+    "sky": "#7BBBE5",
+    "building": "#B5A3B8",
+    "vegetation": "#93B889",
+    "water": "#68B9CC",
+    "object": "#D7B185",
+    "noise": "#B9A8D3",
+}
+
+
+def _hex_to_rgb01(hex_color: str) -> Tuple[float, float, float]:
+    hex_color = hex_color.strip().lstrip("#")
+    if len(hex_color) != 6:
+        raise ValueError(f"Invalid hex color: {hex_color}")
+    return tuple(int(hex_color[i:i+2], 16) / 255.0 for i in (0, 2, 4))
+
+
+def _style_axis(ax, *, grid_axis: Optional[str] = None) -> None:
+    ax.set_facecolor(COLOR_BG)
+    ax.tick_params(axis="both", colors=AXIS_COLOR, labelsize=11)
+    if grid_axis is not None:
+        ax.grid(
+            axis=grid_axis,
+            color=GRID_COLOR,
+            linestyle=(0, (2, 4)),
+            linewidth=0.8,
+            alpha=0.70,
+        )
+    for spine in ["top", "right"]:
+        ax.spines[spine].set_visible(False)
+    for spine in ["left", "bottom"]:
+        ax.spines[spine].set_color(GRID_COLOR)
+        ax.spines[spine].set_linewidth(0.8)
+
+
+def _clean_feature_label(label: str, max_len: int = 34) -> str:
+    label = str(label)
+    return label if len(label) <= max_len else label[: max_len - 1] + "…"
+
+
+# =========================================================
+# 基础函数
+# =========================================================
+def safe_torch_load(
+    path: str | os.PathLike[str],
+    map_location: str | torch.device = "cpu",
+    *,
+    weights_only: bool = False,
+) -> Any:
+    try:
+        return torch.load(path, map_location=map_location, weights_only=weights_only)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
+def region_display_name(region_name: str) -> str:
+    return REGION_CN.get(region_name, region_name)
+
+
+def feature_display_name(feature_name: str, region_name: Optional[str] = None) -> str:
+    base = FEATURE_CN.get(feature_name, feature_name)
+    return base if region_name is None else f"{region_display_name(region_name)}{base}"
+
+
+def region_display_name_en(region_name: str) -> str:
+    return REGION_EN.get(region_name, region_name)
+
+
+def plot_label_from_feature_name(raw_name: str) -> str:
+    raw_name = str(raw_name)
+    if raw_name.startswith("global_"):
+        base_feat = raw_name[len("global_"):]
+        return f"Global {FEATURE_EN.get(base_feat, base_feat)}"
+    for region_name in resolve_region_names():
+        prefix = f"{region_name}_"
+        if raw_name.startswith(prefix):
+            base_feat = raw_name[len(prefix):]
+            return f"{region_display_name_en(region_name)} {FEATURE_EN.get(base_feat, base_feat)}"
+    return raw_name
+
+
+def parse_feature_display_name_cn(raw_name: str, region_names: Sequence[str]) -> str:
+    raw_name = str(raw_name)
+    if raw_name.startswith("global_"):
+        base_feat = raw_name[len("global_"):]
+        return f"全局{FEATURE_CN.get(base_feat, base_feat)}"
+    for region_name in region_names:
+        prefix = f"{region_name}_"
+        if raw_name.startswith(prefix):
+            base_feat = raw_name[len(prefix):]
+            return feature_display_name(base_feat, region_name)
+    return raw_name
+
+
+def is_global_feature_name(raw_name: str) -> bool:
+    return str(raw_name).startswith("global_")
+
+
+def is_region_feature_name(raw_name: str, region_names: Sequence[str]) -> bool:
+    raw_name = str(raw_name)
+    return any(raw_name.startswith(f"{r}_") for r in region_names)
+
+
+def collect_flat_scope_features(
+    shap_values: np.ndarray,
+    feature_names: Sequence[str],
+    feature_values: np.ndarray,
+    region_names: Sequence[str],
+    top_k: int = 8,
+    scope: str = "all",
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    items: List[Dict[str, Any]] = []
+    for name, sval, fval in zip(feature_names, shap_values, feature_values):
+        raw_name = str(name)
+        if raw_name.endswith("_valid") or raw_name.endswith("_area_ratio"):
+            continue
+        if scope == "global" and not is_global_feature_name(raw_name):
+            continue
+        if scope == "region" and not is_region_feature_name(raw_name, region_names):
+            continue
+        items.append(
+            {
+                "feature_name": raw_name,
+                "feature_display_name": parse_feature_display_name_cn(raw_name, region_names),
+                "feature_value": float(fval),
+                "shap_value": float(sval),
+            }
+        )
+    positive = sorted([x for x in items if x["shap_value"] > 0], key=lambda x: x["shap_value"], reverse=True)[:top_k]
+    negative = sorted([x for x in items if x["shap_value"] < 0], key=lambda x: x["shap_value"])[:top_k]
+    return positive, negative
+
+
+def resolve_region_names() -> List[str]:
+    labels = getattr(cfg, "SEMANTIC_LABELS", None)
+    if isinstance(labels, dict):
+        try:
+            return [str(labels[i]) for i in sorted(labels.keys())]
+        except Exception:
+            return [str(v) for _, v in sorted(labels.items())]
+    if isinstance(labels, (list, tuple)):
+        return [str(x) for x in labels]
+    return list(DEFAULT_REGION_NAMES)
+
+
+def resolve_global_feature_names() -> List[str]:
+    names = getattr(cfg, "GLOBAL_FEATURE_NAMES", None)
+    if isinstance(names, (list, tuple)) and len(names) > 0:
+        return [str(x) for x in names]
+    core = getattr(cfg, "CORE_FEATURE_ORDER", None)
+    if isinstance(core, (list, tuple)) and len(core) > 0:
+        return [str(x) for x in core]
+    global_dim = int(getattr(cfg, "GLOBAL_CORE_DIM", 12))
+    return [f"global_feat_{i}" for i in range(global_dim)]
+
+
+def resolve_region_feature_names() -> List[str]:
+    names = getattr(cfg, "REGION_FEATURE_NAMES", None)
+    if isinstance(names, (list, tuple)) and len(names) > 0:
+        return [str(x) for x in names]
+    core = list(getattr(cfg, "CORE_FEATURE_ORDER", [f"region_feat_{i}" for i in range(12)]))
+    meta = list(getattr(cfg, "CSV_SUB_FEATS", ["valid", "area_ratio"]))
+    return [str(x) for x in (core + meta)]
+
+
+def load_raw_image(image_path: str) -> np.ndarray:
+    return np.asarray(Image.open(image_path).convert("RGB"), dtype=np.uint8)
+
+
+# =========================================================
+# 数据与模型
+# =========================================================
+def find_dataset_sample(image_path: str, search_splits: Sequence[str]) -> Optional[Dict[str, Any]]:
+    if AestheticFeatureDataset is None:
+        return None
+
+    stem = Path(image_path).stem.lower()
+    for split in search_splits:
+        try:
+            dataset = AestheticFeatureDataset(split=split, run_tag="default", strict_scaler=True)
+        except Exception:
+            continue
+
+        image_ids = [str(x).lower() for x in getattr(dataset, "image_ids", [])]
+        if stem in image_ids:
+            idx = image_ids.index(stem)
+            sample = dataset[idx]
+            sample["_dataset_split"] = split
+            return sample
+    return None
+
+
+def build_model(checkpoint_path: str, device: torch.device) -> FullAestheticModel:
+    model_cfg = ModelConfig()
+    model_cfg.region_type_embed_dim = 15
+    model = FullAestheticModel(model_cfg).to(device)
+
+    ckpt = safe_torch_load(checkpoint_path, map_location=device, weights_only=False)
+    raw_state_dict = ckpt.get("model_state_dict", ckpt.get("state_dict", ckpt)) if isinstance(ckpt, dict) else ckpt
+
+    model_state = model.state_dict()
+    adapted_state = {}
+    skipped_keys = []
+    adapted_keys = []
+
+    for k, v in raw_state_dict.items():
+        if k not in model_state:
+            continue
+        target = model_state[k]
+        if tuple(v.shape) == tuple(target.shape):
+            adapted_state[k] = v
+            continue
+        if (
+            k == "prediction_module.region_score_head.net.0.weight"
+            and v.ndim == 2
+            and target.ndim == 2
+            and v.shape[0] == target.shape[0]
+            and v.shape[1] + 1 == target.shape[1]
+        ):
+            new_weight = target.clone()
+            new_weight.zero_()
+            new_weight[:, : v.shape[1]] = v
+            adapted_state[k] = new_weight
+            adapted_keys.append(k)
+            continue
+        skipped_keys.append((k, tuple(v.shape), tuple(target.shape)))
+
+    missing, unexpected = model.load_state_dict(adapted_state, strict=False)
+    if adapted_keys:
+        print("[compat] adapted keys:")
+        for k in adapted_keys:
+            print(f"  - {k}")
+    if skipped_keys:
+        print("[compat] skipped mismatched keys:")
+        for k, src_shape, tgt_shape in skipped_keys:
+            print(f"  - {k}: ckpt{src_shape} -> model{tgt_shape}")
+    if missing:
+        print(f"[warn] missing keys when loading checkpoint: {len(missing)}")
+    if unexpected:
+        print(f"[warn] unexpected keys when loading checkpoint: {len(unexpected)}")
+
+    model.eval()
+    return model
+
+
+def _split_handcrafted_features(
+    features: torch.Tensor,
+    region_valid: Optional[torch.Tensor],
+    region_area_ratio: Optional[torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if features.dim() == 1:
+        features = features.unsqueeze(0)
+
+    batch_size = features.size(0)
+    global_core_dim = int(getattr(cfg, "GLOBAL_CORE_DIM", len(resolve_global_feature_names())))
+    region_count = int(getattr(cfg, "REGION_COUNT", getattr(cfg, "SEG_NUM_CLASSES", 8)))
+    region_meta_per_region = int(getattr(cfg, "REGION_META_PER_REGION", 2))
+    region_handcrafted_dim = int(getattr(cfg, "REGION_HANDCRAFTED_DIM", len(resolve_region_feature_names())))
+    region_core_dim = region_handcrafted_dim - region_meta_per_region
+
+    global_handcrafted = features[:, :global_core_dim]
+    region_core = features[:, global_core_dim:].view(batch_size, region_count, region_core_dim)
+
+    if region_valid is None:
+        region_valid = torch.zeros(batch_size, region_count, device=features.device, dtype=features.dtype)
+    if region_area_ratio is None:
+        region_area_ratio = torch.zeros(batch_size, region_count, device=features.device, dtype=features.dtype)
+
+    region_meta = torch.stack([region_valid, region_area_ratio], dim=-1)
+    region_handcrafted = torch.cat([region_core, region_meta], dim=-1)
+    return global_handcrafted, region_handcrafted
+
+
+def load_sample_inputs(
+    image_path: str,
+    device: torch.device,
+    search_splits: Sequence[str],
+    use_online_seg: bool = False,
+) -> Tuple[Dict[str, torch.Tensor], Optional[str]]:
+    sample = find_dataset_sample(image_path, search_splits)
+    if sample is None:
+        raise RuntimeError("未在数据集 split 中找到该图片对应的离线特征。")
+
+    image = sample["image"].unsqueeze(0).to(device).float()
+    vit_image = sample.get("vit_image", sample["image"]).unsqueeze(0).to(device).float()
+
+    semantic_mask = sample.get("semantic_mask", None)
+    if semantic_mask is not None and not use_online_seg:
+        semantic_mask = semantic_mask.unsqueeze(0).to(device).long()
+    else:
+        semantic_mask = None
+
+    feats = sample["features"].unsqueeze(0).to(device).float()
+    region_valid = sample.get("region_valid", None)
+    region_area_ratio = sample.get("region_area_ratio", None)
+    if region_valid is not None:
+        region_valid = region_valid.unsqueeze(0).to(device).float()
+    if region_area_ratio is not None:
+        region_area_ratio = region_area_ratio.unsqueeze(0).to(device).float()
+
+    handcrafted_global, handcrafted_region = _split_handcrafted_features(feats, region_valid, region_area_ratio)
+
+    return {
+        "x": image,
+        "x_vit": vit_image,
+        "seg_masks": semantic_mask,
+        "handcrafted_global": handcrafted_global,
+        "handcrafted_region": handcrafted_region,
+        "region_valid": region_valid,
+        "region_area_ratio": region_area_ratio,
+        "image_id": str(sample.get("image_id", Path(image_path).stem)),
+    }, sample.get("_dataset_split")
+
+
+@torch.no_grad()
+def run_model_forward(model: FullAestheticModel, sample_inputs: Dict[str, torch.Tensor]) -> Dict[str, Any]:
+    return model(
+        x=sample_inputs["x"],
+        x_vit=sample_inputs["x_vit"],
+        handcrafted_global=sample_inputs["handcrafted_global"],
+        handcrafted_region=sample_inputs["handcrafted_region"],
+        seg_masks=sample_inputs["seg_masks"],
+    )
+
+
+def build_background(cache_path: Optional[str], max_samples: int = 64) -> Tuple[torch.Tensor, torch.Tensor]:
+    if cache_path and os.path.isfile(cache_path):
+        payload = safe_torch_load(cache_path, map_location="cpu", weights_only=False)
+        if isinstance(payload, dict) and "global" in payload and "region" in payload:
+            return payload["global"].float(), payload["region"].float()
+
+    if AestheticFeatureDataset is None:
+        raise RuntimeError("无法构建 SHAP background：AestheticFeatureDataset 不可用。")
+
+    dataset = AestheticFeatureDataset(
+        split=getattr(cfg, "TRAIN_SPLIT", "train"),
+        run_tag="default",
+        strict_scaler=True,
+    )
+
+    bg_global: List[torch.Tensor] = []
+    bg_region: List[torch.Tensor] = []
+    for idx in range(len(dataset)):
+        sample = dataset[idx]
+        feats = sample["features"].unsqueeze(0).float()
+        region_valid = sample.get("region_valid", None)
+        region_area_ratio = sample.get("region_area_ratio", None)
+        if region_valid is not None:
+            region_valid = region_valid.unsqueeze(0).float()
+        if region_area_ratio is not None:
+            region_area_ratio = region_area_ratio.unsqueeze(0).float()
+        g, r = _split_handcrafted_features(feats, region_valid, region_area_ratio)
+        bg_global.append(g.squeeze(0))
+        bg_region.append(r.squeeze(0))
+        if len(bg_global) >= max_samples:
+            break
+
+    out_g = torch.stack(bg_global, dim=0)
+    out_r = torch.stack(bg_region, dim=0)
+    if cache_path:
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        torch.save({"global": out_g, "region": out_r}, cache_path)
+    return out_g, out_r
+
+
+def manual_forward_from_intermediate_features(
+    model: FullAestheticModel,
+    outputs: Dict[str, torch.Tensor],
+    handcrafted_global: torch.Tensor,
+    handcrafted_region: torch.Tensor,
+    apply_region_dropout: bool = False,
+) -> Dict[str, Any]:
+    if hasattr(model, "forward_from_intermediate_features"):
+        return model.forward_from_intermediate_features(
+            global_deep_feature=outputs["deep_global_feature"],
+            region_deep_features=outputs.get("deep_region_features"),
+            patch_tokens=outputs["patch_tokens"],
+            handcrafted_global=handcrafted_global,
+            handcrafted_region=handcrafted_region,
+            region_padding_mask=outputs.get("region_padding_mask"),
+            image_region_soft_masks=outputs.get("image_region_soft_masks"),
+            region_soft_masks=outputs.get("region_soft_masks"),
+            apply_region_dropout=apply_region_dropout,
+        )
+    raise RuntimeError("模型缺少 forward_from_intermediate_features 接口。")
+
+
+# =========================================================
+# 可视检测（仅用于展示）
+# =========================================================
+def compute_visual_region_stats(
+    image_region_soft_masks: torch.Tensor,
+    conf_threshold: float = 0.55,
+    min_area_ratio: float = 0.002,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    masks = image_region_soft_masks[0]
+    conf_map = masks.max(dim=0).values
+    label_map = masks.argmax(dim=0)
+    total = float(label_map.numel())
+
+    detected = []
+    area_ratios = []
+    peak_confs = []
+    for ridx in range(masks.size(0)):
+        region_conf = masks[ridx]
+        peak_conf = float(region_conf.max().item())
+        area = (((label_map == ridx) & (conf_map >= conf_threshold)).sum().item()) / max(total, 1.0)
+        is_detected = (peak_conf >= conf_threshold) and (area >= min_area_ratio)
+        detected.append(is_detected)
+        area_ratios.append(area)
+        peak_confs.append(peak_conf)
+
+    device = image_region_soft_masks.device
+    return (
+        torch.tensor(detected, dtype=torch.bool, device=device),
+        torch.tensor(area_ratios, dtype=torch.float32, device=device),
+        torch.tensor(peak_confs, dtype=torch.float32, device=device),
+    )
+
+
+# =========================================================
+# 可解释对象
+# =========================================================
+@dataclass
+class FeatureContribution:
+    feature_name: str
+    feature_display_name: str
+    feature_value: float
+    shap_value: float
+
+
+@dataclass
+class RegionExplanation:
+    region_index: int
+    region_name: str
+    region_display_name: str
+    detected_valid: bool
+    detected_visual: bool
+    area_ratio: float
+    peak_confidence: float
+    region_score_10: float
+    region_score_norm: float
+    region_weight: float
+    region_contribution_score: float
+    region_shap_attribution_score: float
+    is_defect: bool
+    is_advantage: bool
+    positive_features: List[FeatureContribution]
+    negative_features: List[FeatureContribution]
+    lowest_features: List[FeatureContribution]
+    sentence: str
+
+
+# =========================================================
+# SHAP wrapper
+# =========================================================
+class _GlobalScoreWrapper(nn.Module):
+    def __init__(
+        self,
+        full_model: nn.Module,
+        outputs_cache: Dict[str, torch.Tensor],
+        global_dim: int,
+        num_regions: int,
+        region_dim: int,
+        manual_forward_fn,
+    ) -> None:
+        super().__init__()
+        self.full_model = full_model
+        self.outputs_cache = outputs_cache
+        self.global_dim = int(global_dim)
+        self.num_regions = int(num_regions)
+        self.region_dim = int(region_dim)
+        self.manual_forward_fn = manual_forward_fn
+
+    def _maybe_expand(self, value: Any, batch_size: int) -> Any:
+        if value is None:
+            return None
+        if not torch.is_tensor(value):
+            return value
+        if value.dim() > 0 and value.size(0) == 1 and batch_size > 1:
+            expand_sizes = [batch_size] + [-1] * (value.dim() - 1)
+            return value.expand(*expand_sizes).clone()
+        return value.clone()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        device = self.outputs_cache["deep_global_feature"].device
+        x = x.to(device)
+        handcrafted_global = x[:, :self.global_dim]
+        handcrafted_region = x[:, self.global_dim:].reshape(-1, self.num_regions, self.region_dim)
+
+        batch_size = handcrafted_global.size(0)
+        outputs_cache: Dict[str, Any] = {k: self._maybe_expand(v, batch_size) for k, v in self.outputs_cache.items()}
+
+        out = self.manual_forward_fn(
+            self.full_model,
+            outputs_cache,
+            handcrafted_global,
+            handcrafted_region,
+            apply_region_dropout=False,
+        )
+
+        y = out["final_score_10"]
+        if y.ndim == 1:
+            y = y.unsqueeze(-1)
+        elif y.ndim > 2:
+            y = y.reshape(y.shape[0], -1)[:, :1]
+        return y
+
+
+# =========================================================
+# 解释器
+# =========================================================
+class ExplainabilityEngineStrictOriginalDesign:
+    def __init__(
+        self,
+        region_names: Sequence[str],
+        global_feature_names: Sequence[str],
+        region_feature_names: Sequence[str],
+        manual_forward_fn,
+    ) -> None:
+        self.region_names = list(region_names)
+        self.global_feature_names = list(global_feature_names)
+        self.region_feature_names = list(region_feature_names)
+        self.manual_forward_fn = manual_forward_fn
+
+    def _flatten_features(self, hg: torch.Tensor, hr: torch.Tensor) -> torch.Tensor:
+        return torch.cat([hg, hr.flatten(start_dim=1)], dim=1)
+
+    def _flat_feature_names(self, global_dim: int, region_dim: int) -> List[str]:
+        gnames = self.global_feature_names if len(self.global_feature_names) == global_dim else [f"global_feat_{i}" for i in range(global_dim)]
+        rnames = self.region_feature_names if len(self.region_feature_names) == region_dim else [f"region_feat_{i}" for i in range(region_dim)]
+        out = [f"global_{n}" for n in gnames]
+        for region_name in self.region_names:
+            for fname in rnames:
+                out.append(f"{region_name}_{fname}")
+        return out
+
+    def compute_global_shap(
+        self,
+        model: nn.Module,
+        outputs: Dict[str, torch.Tensor],
+        background_global: torch.Tensor,
+        background_region: torch.Tensor,
+        sample_global: torch.Tensor,
+        sample_region: torch.Tensor,
+    ) -> Tuple[np.ndarray, float, str, List[str], np.ndarray]:
+        wrapper = _GlobalScoreWrapper(
+            full_model=model,
+            outputs_cache=outputs,
+            global_dim=sample_global.size(-1),
+            num_regions=sample_region.size(1),
+            region_dim=sample_region.size(2),
+            manual_forward_fn=self.manual_forward_fn,
+        ).eval()
+
+        device = outputs["deep_global_feature"].device
+        bg = self._flatten_features(background_global.to(device), background_region.to(device))
+        x = self._flatten_features(sample_global.to(device), sample_region.to(device))
+        names = self._flat_feature_names(sample_global.size(-1), sample_region.size(2))
+
+        if shap is None:
+            x_grad = x.clone().detach().requires_grad_(True)
+            y = wrapper(x_grad).sum()
+            y.backward()
+            vals = x_grad.grad.detach().cpu().numpy() * x.detach().cpu().numpy()
+            base_value = float(wrapper(bg).mean().detach().cpu().item())
+            return vals[0], base_value, "Grad*Input", names, x.detach().cpu().numpy()[0]
+
+        try:
+            explainer = shap.GradientExplainer(wrapper, bg)
+            shap_values = explainer.shap_values(x)
+            if isinstance(shap_values, list):
+                shap_values = shap_values[0]
+            shap_arr = np.asarray(shap_values, dtype=np.float32)
+            expected_value = getattr(explainer, "expected_value", None)
+            if isinstance(expected_value, (list, tuple, np.ndarray)):
+                base_value = float(np.asarray(expected_value).reshape(-1)[0])
+            elif expected_value is None:
+                base_value = float(wrapper(bg).mean().detach().cpu().item())
+            else:
+                base_value = float(expected_value)
+            return shap_arr[0], base_value, "GradientExplainer", names, x.detach().cpu().numpy()[0]
+        except Exception:
+            x_grad = x.clone().detach().requires_grad_(True)
+            y = wrapper(x_grad).sum()
+            y.backward()
+            vals = x_grad.grad.detach().cpu().numpy() * x.detach().cpu().numpy()
+            base_value = float(wrapper(bg).mean().detach().cpu().item())
+            return vals[0], base_value, "Grad*Input", names, x.detach().cpu().numpy()[0]
+
+    @staticmethod
+    def _top_signed_features(
+        shap_values: np.ndarray,
+        feature_names: Sequence[str],
+        feature_values: np.ndarray,
+        top_k: int,
+        region_name: Optional[str],
+        exclude_meta: bool = True,
+    ) -> Tuple[List[FeatureContribution], List[FeatureContribution]]:
+        items: List[Tuple[str, float, float]] = []
+        for fname, sval, fval in zip(feature_names, shap_values, feature_values):
+            name = str(fname)
+            if exclude_meta and name in META_FEATURES:
+                continue
+            items.append((name, float(sval), float(fval)))
+        pos = sorted([x for x in items if x[1] > 0], key=lambda t: t[1], reverse=True)[:top_k]
+        neg = sorted([x for x in items if x[1] < 0], key=lambda t: t[1])[:top_k]
+        pos_items = [FeatureContribution(name, feature_display_name(name, region_name), fval, sval) for name, sval, fval in pos]
+        neg_items = [FeatureContribution(name, feature_display_name(name, region_name), fval, sval) for name, sval, fval in neg]
+        return pos_items, neg_items
+
+    @staticmethod
+    def _lowest_value_features(
+        feature_names: Sequence[str],
+        feature_values: np.ndarray,
+        shap_values: np.ndarray,
+        top_k: int,
+        region_name: Optional[str],
+        exclude_meta: bool = True,
+    ) -> List[FeatureContribution]:
+        items: List[Tuple[str, float, float]] = []
+        for fname, fval, sval in zip(feature_names, feature_values, shap_values):
+            name = str(fname)
+            if exclude_meta and name in META_FEATURES:
+                continue
+            items.append((name, float(fval), float(sval)))
+        lowest = sorted(items, key=lambda t: t[1])[:top_k]
+        return [FeatureContribution(name, feature_display_name(name, region_name), fval, sval) for name, fval, sval in lowest]
+
+    @staticmethod
+    def compute_region_contributions_original_design(outputs: Dict[str, torch.Tensor]) -> Optional[torch.Tensor]:
+        region_weights = outputs.get("region_weights")
+        region_scores = outputs.get("region_scores")
+        region_padding_mask = outputs.get("region_padding_mask")
+        if region_weights is None or region_scores is None:
+            return None
+        contributions = region_weights * (region_scores - 0.5)
+        if region_padding_mask is not None:
+            contributions = contributions.masked_fill(region_padding_mask, 0.0)
+        return contributions
+
+    def aggregate_region_shap(self, shap_values_flat: np.ndarray, global_dim: int, region_dim: int) -> np.ndarray:
+        region_sums = []
+        for ridx, _ in enumerate(self.region_names):
+            start = global_dim + ridx * region_dim
+            end = start + region_dim
+            local_vals = shap_values_flat[start:end]
+            usable = [float(sval) for fname, sval in zip(self.region_feature_names, local_vals) if fname not in META_FEATURES]
+            region_sums.append(float(np.sum(usable)) if usable else 0.0)
+        return np.asarray(region_sums, dtype=np.float32)
+
+    def build_region_explanations(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        shap_values_flat: np.ndarray,
+        flat_input: np.ndarray,
+        visual_detected_mask: Optional[torch.Tensor],
+        visual_area_ratio: Optional[torch.Tensor],
+        visual_peak_conf: Optional[torch.Tensor],
+        defect_threshold: float = 6.0,
+        advantage_threshold: float = 7.5,
+    ) -> List[RegionExplanation]:
+        region_scores_norm = outputs.get("region_scores", None)
+        region_scores_10 = outputs.get("region_scores_10", None)
+        region_weights = outputs.get("region_weights", None)
+        region_padding_mask = outputs.get("region_padding_mask", None)
+
+        global_dim = len(self.global_feature_names)
+        region_dim = len(self.region_feature_names)
+        region_shap_sums = self.aggregate_region_shap(shap_values_flat, global_dim, region_dim)
+        # 仅修复区域贡献计算：主展示口径改为“区域特征组在 final_score 路径上的 SHAP 聚合贡献”。
+        # 这样可保持现有打印/可视化/字段名不变，同时避免与区域级 SHAP 正负号冲突。
+        model_region_contrib = region_shap_sums
+        region_items: List[RegionExplanation] = []
+
+        for ridx, rname in enumerate(self.region_names):
+            rdisplay = region_display_name(rname)
+            detected_valid = True
+            if region_padding_mask is not None:
+                detected_valid = not bool(region_padding_mask[0, ridx].item())
+            detected_visual = False
+            if visual_detected_mask is not None:
+                detected_visual = bool(visual_detected_mask[0, ridx].item())
+            area_ratio = 0.0
+            if visual_area_ratio is not None:
+                area_ratio = float(visual_area_ratio[0, ridx].item())
+            peak_conf = 0.0
+            if visual_peak_conf is not None:
+                peak_conf = float(visual_peak_conf[0, ridx].item())
+
+            rscore10 = float("nan")
+            if region_scores_10 is not None and detected_valid and not torch.isnan(region_scores_10[0, ridx]):
+                rscore10 = float(region_scores_10[0, ridx].item())
+            rscore_norm = float("nan")
+            if region_scores_norm is not None and detected_valid and not torch.isnan(region_scores_norm[0, ridx]):
+                rscore_norm = float(region_scores_norm[0, ridx].item())
+            rweight = 0.0
+            if region_weights is not None:
+                try:
+                    rweight = float(region_weights[0, ridx].item())
+                except Exception:
+                    rweight = 0.0
+            rcontrib = 0.0
+            if model_region_contrib is not None:
+                try:
+                    # model_region_contrib 现在直接使用 region_shap_sums（numpy 向量）
+                    rcontrib = float(model_region_contrib[ridx])
+                except Exception:
+                    rcontrib = 0.0
+
+            start = global_dim + ridx * region_dim
+            end = start + region_dim
+            local_shap = shap_values_flat[start:end]
+            local_input = flat_input[start:end]
+            pos_feats, neg_feats = self._top_signed_features(local_shap, self.region_feature_names, local_input, 3, rname, True)
+            lowest_feats = self._lowest_value_features(self.region_feature_names, local_input, local_shap, 3, rname, True)
+
+            is_defect = bool(detected_valid and not np.isnan(rscore10) and rscore10 < defect_threshold)
+            is_advantage = bool(detected_valid and not np.isnan(rscore10) and rscore10 > advantage_threshold)
+
+            if not detected_visual and not detected_valid:
+                sentence = f"{rdisplay}未检测到，也未参与评分。"
+            elif detected_visual and not detected_valid:
+                sentence = f"{rdisplay}在视觉上被检测到，但未作为有效区域参与评分。"
+            elif not detected_valid:
+                sentence = f"{rdisplay}未作为有效区域参与评分。"
+            elif is_defect:
+                low_text = "、".join([
+                    f"{x.feature_display_name}(value={x.feature_value:.3f}, SHAP{x.shap_value:+.3f})" for x in lowest_feats
+                ]) or "暂无明显低分特征"
+                sentence = (
+                    f"{rdisplay}子评分为 {rscore10:.2f}/10；按原始设计贡献定义，其区域贡献为 {rcontrib:+.3f}；"
+                    f"该区域属于缺陷区域，主要低值特征为：{low_text}。"
+                )
+            elif is_advantage:
+                good_text = "、".join([
+                    f"{x.feature_display_name}(value={x.feature_value:.3f}, SHAP{x.shap_value:+.3f})" for x in pos_feats
+                ]) or "暂无明显正向特征"
+                sentence = (
+                    f"{rdisplay}子评分为 {rscore10:.2f}/10；按原始设计贡献定义，其区域贡献为 {rcontrib:+.3f}；"
+                    f"该区域属于优势区域，主要正向 SHAP 特征为：{good_text}。"
+                )
+            else:
+                mix_text = "、".join([
+                    f"{x.feature_display_name}(value={x.feature_value:.3f}, SHAP{x.shap_value:+.3f})" for x in (pos_feats[:1] + neg_feats[:1])
+                ]) or "无明显突出特征"
+                sentence = (
+                    f"{rdisplay}子评分为 {rscore10:.2f}/10；按原始设计贡献定义，其区域贡献为 {rcontrib:+.3f}；"
+                    f"区域级 SHAP 相关特征：{mix_text}。"
+                )
+
+            region_items.append(
+                RegionExplanation(
+                    region_index=ridx,
+                    region_name=rname,
+                    region_display_name=rdisplay,
+                    detected_valid=detected_valid,
+                    detected_visual=detected_visual,
+                    area_ratio=area_ratio,
+                    peak_confidence=peak_conf,
+                    region_score_10=rscore10,
+                    region_score_norm=rscore_norm,
+                    region_weight=rweight,
+                    region_contribution_score=rcontrib,
+                    region_shap_attribution_score=float(region_shap_sums[ridx]),
+                    is_defect=is_defect,
+                    is_advantage=is_advantage,
+                    positive_features=pos_feats,
+                    negative_features=neg_feats,
+                    lowest_features=lowest_feats,
+                    sentence=sentence,
+                )
+            )
+        return region_items
+
+    def build_summary(
+        self,
+        final_score_10: float,
+        global_pos: List[FeatureContribution],
+        global_neg: List[FeatureContribution],
+        region_exps: List[RegionExplanation],
+        region_flat_pos: List[Dict[str, Any]],
+        region_flat_neg: List[Dict[str, Any]],
+        defect_threshold: float,
+    ) -> str:
+        text = f"整图美学评分为 {final_score_10:.2f}/10。"
+        valid_regions = [x for x in region_exps if x.detected_valid]
+        visual_regions = [x for x in region_exps if x.detected_visual]
+        defects = [x for x in region_exps if x.is_defect]
+        advantages = [x for x in region_exps if x.is_advantage]
+
+        def fmt_region_item(x: RegionExplanation) -> str:
+            if np.isnan(x.region_score_10):
+                score_text = "N/A"
+            else:
+                score_text = f"{x.region_score_10:.2f}/10"
+            return (
+                f"{x.region_display_name}(面积{x.area_ratio:.3%}, 置信度{x.peak_confidence:.3f}, 子评分{score_text}, "
+                f"区域贡献{x.region_contribution_score:+.3f})"
+            )
+
+        if visual_regions:
+            visual_regions = sorted(visual_regions, key=lambda x: abs(x.region_contribution_score), reverse=True)
+            text += " 检测到的区域及其模型区域贡献：" + "、".join([fmt_region_item(x) for x in visual_regions]) + "。"
+        if valid_regions:
+            valid_regions = sorted(valid_regions, key=lambda x: abs(x.region_contribution_score), reverse=True)
+            text += " 参与评分的有效区域：" + "、".join([fmt_region_item(x) for x in valid_regions]) + "。"
+        if global_pos:
+            text += " 全局特征 SHAP 正向归因：" + "、".join([
+                f"全局{x.feature_display_name}(value={x.feature_value:.3f}, SHAP{x.shap_value:+.3f})" for x in global_pos[:2]
+            ]) + "。"
+        if global_neg:
+            text += " 全局特征 SHAP 负向归因：" + "、".join([
+                f"全局{x.feature_display_name}(value={x.feature_value:.3f}, SHAP{x.shap_value:+.3f})" for x in global_neg[:2]
+            ]) + "。"
+        if region_flat_pos:
+            text += " 区域特征 SHAP 正向归因：" + "、".join([
+                f"{x['feature_display_name']}(value={x['feature_value']:.3f}, SHAP{x['shap_value']:+.3f})" for x in region_flat_pos[:3]
+            ]) + "。"
+        if region_flat_neg:
+            text += " 区域特征 SHAP 负向归因：" + "、".join([
+                f"{x['feature_display_name']}(value={x['feature_value']:.3f}, SHAP{x['shap_value']:+.3f})" for x in region_flat_neg[:3]
+            ]) + "。"
+        if advantages:
+            top_adv = sorted(advantages, key=lambda x: x.region_score_10, reverse=True)[:2]
+            text += " 优势区域：" + "、".join([fmt_region_item(x) for x in top_adv]) + "。"
+        if defects:
+            top_def = sorted(defects, key=lambda x: x.region_score_10)[:2]
+            text += f" 缺陷定位（阈值<{defect_threshold:.0f}分）：" + " ".join([x.sentence for x in top_def])
+        return text
+
+    def explain(
+        self,
+        model: nn.Module,
+        outputs: Dict[str, torch.Tensor],
+        bg_global: torch.Tensor,
+        bg_region: torch.Tensor,
+        visual_detected_mask: Optional[torch.Tensor],
+        visual_area_ratio: Optional[torch.Tensor],
+        visual_peak_conf: Optional[torch.Tensor],
+        defect_threshold: float = 6.0,
+        advantage_threshold: float = 7.5,
+    ) -> Dict[str, Any]:
+        hg = outputs["raw_handcrafted_global"]
+        hr = outputs["raw_handcrafted_region"]
+        shap_values, base_value, shap_method, flat_names, flat_input = self.compute_global_shap(
+            model=model,
+            outputs=outputs,
+            background_global=bg_global,
+            background_region=bg_region,
+            sample_global=hg,
+            sample_region=hr,
+        )
+
+        global_dim = len(self.global_feature_names)
+        global_shap = shap_values[:global_dim]
+        global_input = flat_input[:global_dim]
+        global_pos, global_neg = self._top_signed_features(global_shap, self.global_feature_names, global_input, 8, None, True)
+
+        region_exps = self.build_region_explanations(
+            outputs=outputs,
+            shap_values_flat=shap_values,
+            flat_input=flat_input,
+            visual_detected_mask=visual_detected_mask,
+            visual_area_ratio=visual_area_ratio,
+            visual_peak_conf=visual_peak_conf,
+            defect_threshold=defect_threshold,
+            advantage_threshold=advantage_threshold,
+        )
+        region_flat_pos, region_flat_neg = collect_flat_scope_features(
+            shap_values=shap_values,
+            feature_names=flat_names,
+            feature_values=flat_input,
+            region_names=self.region_names,
+            top_k=10,
+            scope="region",
+        )
+        final_score_10 = float(outputs["final_score_10"][0].item())
+        summary = self.build_summary(final_score_10, global_pos, global_neg, region_exps, region_flat_pos, region_flat_neg, defect_threshold)
+
+        return {
+            "final_score_10": final_score_10,
+            "base_value": base_value,
+            "shap_method": shap_method,
+            "global_shap_values_flat": shap_values.tolist(),
+            "global_feature_names_flat": flat_names,
+            "flat_input": flat_input.tolist(),
+            "global_positive_features": [asdict(x) for x in global_pos],
+            "global_negative_features": [asdict(x) for x in global_neg],
+            "region_positive_features_flat": region_flat_pos,
+            "region_negative_features_flat": region_flat_neg,
+            "region_explanations": [asdict(x) for x in region_exps],
+            "visual_detected_regions": [x.region_name for x in region_exps if x.detected_visual],
+            "valid_regions_for_scoring": [x.region_name for x in region_exps if x.detected_valid],
+            "visual_detected_region_contributions": [
+                {
+                    "region_name": x.region_name,
+                    "region_display_name": x.region_display_name,
+                    "region_score_10": x.region_score_10,
+                    "region_score_norm": x.region_score_norm,
+                    "region_contribution_score": x.region_contribution_score,
+                    "region_shap_attribution_score": x.region_shap_attribution_score,
+                    "region_weight": x.region_weight,
+                    "area_ratio": x.area_ratio,
+                    "peak_confidence": x.peak_confidence,
+                }
+                for x in region_exps if x.detected_visual
+            ],
+            "valid_region_contributions": [
+                {
+                    "region_name": x.region_name,
+                    "region_display_name": x.region_display_name,
+                    "region_score_10": x.region_score_10,
+                    "region_score_norm": x.region_score_norm,
+                    "region_contribution_score": x.region_contribution_score,
+                    "region_shap_attribution_score": x.region_shap_attribution_score,
+                    "region_weight": x.region_weight,
+                    "area_ratio": x.area_ratio,
+                    "peak_confidence": x.peak_confidence,
+                }
+                for x in region_exps if x.detected_valid
+            ],
+            "summary": summary,
+        }
+
+
+# =========================================================
+# 绘图
+# =========================================================
+def _ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
+def save_single_sample_waterfall(explanation_result: Dict[str, Any], save_path: str, max_display: int = 15) -> None:
+    """
+    使用统一论文配色绘制单样本 SHAP 分解图。
+    为避免与其他图风格割裂，这里采用自定义的 waterfall-like 累积条形图，
+    颜色与其它解释图保持一致：正向=粉，负向=蓝，背景=白色。
+    """
+    shap_vals = np.asarray(explanation_result["global_shap_values_flat"], dtype=np.float32).reshape(-1)
+    base_value = float(explanation_result["base_value"])
+    feature_names = [plot_label_from_feature_name(x) for x in explanation_result["global_feature_names_flat"]]
+    pred_value = float(explanation_result.get("final_score_10", base_value + float(np.sum(shap_vals))))
+
+    order = np.argsort(np.abs(shap_vals))[::-1]
+    top_order = order[:max_display]
+    other_sum = float(np.sum(shap_vals) - np.sum(shap_vals[top_order]))
+
+    rows: List[Tuple[str, float]] = [
+        (_clean_feature_label(feature_names[i], 36), float(shap_vals[i])) for i in top_order
+    ]
+    if abs(other_sum) > 1e-6:
+        rows.append(("Other features", other_sum))
+
+    # 从 base value 开始做累积贡献分解。
+    starts = []
+    widths = []
+    colors = []
+    running = base_value
+    for _, delta in rows:
+        starts.append(min(running, running + delta))
+        widths.append(abs(delta))
+        colors.append(COLOR_POS if delta >= 0 else COLOR_NEG)
+        running += delta
+
+    labels = [r[0] for r in rows]
+    deltas = [r[1] for r in rows]
+    y = np.arange(len(rows))
+
+    x_min = min([base_value, pred_value] + starts)
+    x_max = max([base_value, pred_value] + [s + w for s, w in zip(starts, widths)])
+    x_pad = max((x_max - x_min) * 0.10, 0.08)
+
+    fig, ax = plt.subplots(figsize=(11.6, max(4.6, 0.52 * len(rows) + 2.2)), facecolor=COLOR_FIG)
+    _style_axis(ax, grid_axis="x")
+
+    ax.barh(y, widths, left=starts, color=colors, edgecolor="none", height=0.64, alpha=0.92, zorder=3)
+
+    # 连接线强调累积过程
+    running = base_value
+    for idx, delta in enumerate(deltas):
+        next_running = running + delta
+        ax.plot([running, running], [idx - 0.32, idx + 0.32], color=ZERO_LINE, lw=1.0, alpha=0.8, zorder=2)
+        ax.plot([running, next_running], [idx, idx], color=ZERO_LINE, lw=1.0, alpha=0.55, zorder=2)
+        running = next_running
+
+    for idx, delta in enumerate(deltas):
+        x_text = starts[idx] + widths[idx] + max((x_max - x_min) * 0.012, 0.01) if delta >= 0 else starts[idx] - max((x_max - x_min) * 0.012, 0.01)
+        ax.text(
+            x_text,
+            idx,
+            f"{delta:+.3f}",
+            va="center",
+            ha="left" if delta >= 0 else "right",
+            fontsize=10,
+            color=TEXT_COLOR,
+        )
+
+    ax.axvline(base_value, color=GRID_COLOR, lw=1.2, linestyle="--", zorder=1)
+    ax.axvline(pred_value, color=ZERO_LINE, lw=1.3, zorder=1)
+    ax.text(base_value, len(rows) + 0.08, f"Base {base_value:.2f}", ha="center", va="bottom", fontsize=10, color=AXIS_COLOR)
+    ax.text(pred_value, len(rows) + 0.08, f"Pred {pred_value:.2f}", ha="center", va="bottom", fontsize=10, color=AXIS_COLOR)
+
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels, fontsize=10)
+    ax.set_xlim(x_min - x_pad, x_max + x_pad)
+    ax.set_xlabel("Contribution to predicted score", fontsize=12, color=AXIS_COLOR)
+    ax.set_title("Single-sample SHAP contribution breakdown", fontsize=14, pad=12, color=TEXT_COLOR)
+    ax.invert_yaxis()
+
+    plt.tight_layout()
+    # 同时保存 SVG 和 PNG 两份
+    p = Path(save_path)
+    stem_dir = str(p.with_suffix(""))
+    plt.savefig(stem_dir + ".svg", format="svg", bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.savefig(stem_dir + ".png", format="png", dpi=200, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+
+
+def save_local_bar_pretty(items: List[Dict[str, Any]], title: str, save_path: str, top_k: int = 10) -> None:
+    rows = [
+        (
+            _clean_feature_label(plot_label_from_feature_name(item["feature_name"]), 42),
+            float(item["shap_value"]),
+        )
+        for item in items
+    ]
+    rows = sorted(rows, key=lambda x: abs(x[1]), reverse=True)[:top_k][::-1]
+    labels = [x[0] for x in rows]
+    values = [x[1] for x in rows]
+    colors = [COLOR_POS if v >= 0 else COLOR_NEG for v in values]
+
+    vmax = max(max(abs(v) for v in values), 1e-6) if values else 1.0
+    pad = vmax * 0.20
+
+    fig, ax = plt.subplots(figsize=(11.8, max(4.4, 0.56 * len(rows) + 1.7)), facecolor=COLOR_FIG)
+    _style_axis(ax, grid_axis="x")
+    ax.barh(labels, values, color=colors, alpha=0.94, edgecolor="none", zorder=3)
+    ax.axvline(0, color=ZERO_LINE, lw=1.1, zorder=2)
+    ax.set_xlim(-vmax - pad, vmax + pad)
+
+    for i, v in enumerate(values):
+        dx = vmax * 0.04
+        ax.text(
+            v + (dx if v >= 0 else -dx),
+            i,
+            f"{v:+.3f}",
+            va="center",
+            ha="left" if v >= 0 else "right",
+            fontsize=10,
+            color=TEXT_COLOR,
+        )
+
+    ax.set_title(title, fontsize=14, pad=12, color=TEXT_COLOR)
+    ax.set_xlabel("SHAP contribution to predicted score", fontsize=12, color=AXIS_COLOR)
+    ax.tick_params(axis="y", labelsize=10)
+    plt.tight_layout()
+    # 同时保存 SVG 和 PNG 两份
+    p = Path(save_path)
+    stem_dir = str(p.with_suffix(""))
+    plt.savefig(stem_dir + ".svg", format="svg", bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.savefig(stem_dir + ".png", format="png", dpi=200, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+
+def save_region_feature_heatmap(
+    explanation_result: Dict[str, Any],
+    region_names: Sequence[str],
+    region_feature_names: Sequence[str],
+    save_path: str,
+    use_abs: bool = True,
+) -> None:
+    shap_vals = np.asarray(explanation_result["global_shap_values_flat"], dtype=np.float32)
+    flat_names = list(explanation_result["global_feature_names_flat"])
+    rows = []
+    plot_region_names = [region_display_name_en(r) for r in region_names]
+    plot_feat_names = [FEATURE_EN.get(f, f) for f in region_feature_names if f not in META_FEATURES]
+    for region_name in region_names:
+        row = []
+        for feat_name in region_feature_names:
+            if feat_name in META_FEATURES:
+                continue
+            full_name = f"{region_name}_{feat_name}"
+            if full_name in flat_names:
+                idx = flat_names.index(full_name)
+                val = float(shap_vals[idx])
+            else:
+                val = 0.0
+            row.append(abs(val) if use_abs else val)
+        rows.append(row)
+    data = np.asarray(rows, dtype=np.float32)
+
+    fig, ax = plt.subplots(figsize=(11.2, 5.9), facecolor=COLOR_FIG)
+    _style_axis(ax)
+    cmap = PAPER_SEQ_CMAP if use_abs else PAPER_DIV_CMAP
+    im = ax.imshow(data, aspect="auto", cmap=cmap)
+    ax.set_xticks(np.arange(len(plot_feat_names)))
+    ax.set_xticklabels(plot_feat_names, rotation=35, ha="right", fontsize=9, color=AXIS_COLOR)
+    ax.set_yticks(np.arange(len(plot_region_names)))
+    ax.set_yticklabels(plot_region_names, fontsize=10, color=AXIS_COLOR)
+    ax.set_title("Region-feature SHAP heatmap", fontsize=14, pad=12, color=TEXT_COLOR)
+
+    cbar = plt.colorbar(im, ax=ax, fraction=0.03, pad=0.03)
+    cbar.set_label("|SHAP|" if use_abs else "SHAP", fontsize=11, color=AXIS_COLOR)
+    cbar.ax.tick_params(labelsize=10, colors=AXIS_COLOR)
+    cbar.outline.set_visible(False)
+    cbar.ax.set_facecolor(COLOR_FIG)
+
+    plt.tight_layout()
+    # 同时保存 SVG 和 PNG 两份
+    p = Path(save_path)
+    stem_dir = str(p.with_suffix(""))
+    plt.savefig(stem_dir + ".svg", format="svg", bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.savefig(stem_dir + ".png", format="png", dpi=200, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+
+def save_region_low_value_bar(items: List[Dict[str, Any]], title: str, save_path: str, top_k: int = 8) -> None:
+    rows = [
+        (
+            _clean_feature_label(plot_label_from_feature_name(item["feature_name"]), 38),
+            float(item["feature_value"]),
+            float(item["shap_value"]),
+        )
+        for item in items
+    ]
+    rows = sorted(rows, key=lambda x: x[1])[:top_k][::-1]
+    labels = [f"{x[0]} | SHAP={x[2]:+.3f}" for x in rows]
+    values = [x[1] for x in rows]
+
+    fig, ax = plt.subplots(figsize=(11.4, max(4.2, 0.54 * len(rows) + 1.6)), facecolor=COLOR_FIG)
+    _style_axis(ax, grid_axis="x")
+    ax.barh(labels, values, color=LOW_VALUE_BAR, alpha=0.94, edgecolor="none", zorder=3)
+    for i, v in enumerate(values):
+        shift = max((max(values) - min(values)) * 0.03 if len(values) > 1 else 0.02, 0.02)
+        ax.text(v + shift, i, f"{v:.3f}", va="center", ha="left", fontsize=10, color=TEXT_COLOR)
+    ax.set_title(title, fontsize=14, pad=12, color=TEXT_COLOR)
+    ax.set_xlabel("Model-input feature value (lower is worse)", fontsize=12, color=AXIS_COLOR)
+    ax.tick_params(axis="y", labelsize=10)
+    plt.tight_layout()
+    # 同时保存 SVG 和 PNG 两份
+    p = Path(save_path)
+    stem_dir = str(p.with_suffix(""))
+    plt.savefig(stem_dir + ".svg", format="svg", bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.savefig(stem_dir + ".png", format="png", dpi=200, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+
+def save_region_overview(
+     region_explanations: List[Dict[str, Any]],
+     save_path: str,
+     defect_threshold: float = 6.0,
+ ) -> None:
+     """
+     左图这种形式：
+     - 左侧面板：区域子评分（横向条形图）
+     - 右侧面板：区域贡献（横向条形图）
+     - 背景统一白色
+     - 配色沿用当前脚本统一论文配色
+     """
+     valid_items = [x for x in region_explanations if x["detected_valid"]]
+     if len(valid_items) == 0:
+         raise RuntimeError("没有有效区域可绘制。")
+
+     names = [region_display_name_en(x["region_name"]) for x in valid_items]
+     region_scores = np.asarray(
+         [float(x["region_score_10"]) for x in valid_items], dtype=np.float32
+     )
+     region_contrib = np.asarray(
+         [float(x["region_contribution_score"]) for x in valid_items], dtype=np.float32
+     )
+
+     y = np.arange(len(names), dtype=np.float32)
+     contrib_colors = [
+         REGION_CONTRIB_POS if v >= 0 else REGION_CONTRIB_NEG for v in region_contrib
+     ]
+
+     max_abs_contrib = float(np.max(np.abs(region_contrib))) if len(region_contrib) > 0 else 0.05
+     max_abs_contrib = max(max_abs_contrib * 1.15, 0.02)
+
+     fig, (ax_score, ax_contrib) = plt.subplots(
+         1, 2,
+         figsize=(11.8, 5.2),
+         gridspec_kw={"width_ratios": [1.15, 1.0], "wspace": 0.08},
+         facecolor=FIG_BG,
+         sharey=True,
+     )
+
+     # 统一白底
+     ax_score.set_facecolor(FIG_BG)
+     ax_contrib.set_facecolor(FIG_BG)
+
+     # ===== 左：区域子评分 =====
+     bars_score = ax_score.barh(
+         y,
+         region_scores,
+         color=REGION_SCORE_BAR,
+         edgecolor="none",
+         alpha=0.95,
+         height=0.52,
+         zorder=3,
+     )
+
+     ax_score.axvline(
+         defect_threshold,
+         color=DEFECT_LINE,
+         linestyle="--",
+         lw=1.2,
+         alpha=0.95,
+         zorder=2,
+     )
+
+     for yi, val in zip(y, region_scores):
+         ax_score.text(
+             val + 0.08,
+             yi,
+             f"{val:.2f}/10",
+             va="center",
+             ha="left",
+             fontsize=10,
+             color=TEXT_COLOR,
+         )
+
+     ax_score.set_yticks(y)
+     ax_score.set_yticklabels(names, fontsize=11, color=AXIS_COLOR)
+     ax_score.set_xlim(0, 10)
+     ax_score.set_xlabel("Region sub-score (0-10)", fontsize=11, color=AXIS_COLOR)
+     ax_score.set_title("Region sub-scores", fontsize=12, pad=10, color=TEXT_COLOR)
+     ax_score.grid(axis="x", color=GRID_COLOR, linestyle="-", linewidth=0.6, alpha=0.35)
+     ax_score.tick_params(axis="x", labelsize=10, colors=AXIS_COLOR)
+     ax_score.tick_params(axis="y", labelsize=11, colors=AXIS_COLOR)
+
+     # ===== 右：区域贡献 =====
+     bars_contrib = ax_contrib.barh(
+         y,
+         region_contrib,
+         color=contrib_colors,
+         edgecolor="none",
+         alpha=0.95,
+         height=0.60,
+         zorder=3,
+     )
+
+     ax_contrib.axvline(0.0, color=ZERO_LINE, lw=1.1, alpha=0.9, zorder=2)
+
+     for yi, val in zip(y, region_contrib):
+         if val >= 0:
+             x_text = val + max_abs_contrib * 0.04
+             ha = "left"
+         else:
+             x_text = val - max_abs_contrib * 0.04
+             ha = "right"
+         ax_contrib.text(
+             x_text,
+             yi,
+             f"{val:+.3f}",
+             va="center",
+             ha=ha,
+             fontsize=10,
+             color=TEXT_COLOR,
+         )
+
+     ax_contrib.set_xlim(-max_abs_contrib, max_abs_contrib)
+     ax_contrib.set_xlabel("Region contribution (original design)", fontsize=11, color=AXIS_COLOR)
+     ax_contrib.set_title("Region contributions", fontsize=12, pad=10, color=TEXT_COLOR)
+     ax_contrib.grid(axis="x", color=GRID_COLOR, linestyle="-", linewidth=0.6, alpha=0.35)
+     ax_contrib.tick_params(axis="x", labelsize=10, colors=AXIS_COLOR)
+     ax_contrib.tick_params(axis="y", left=False, labelleft=False)
+
+     # 让第一个区域在最上面，和你左图一致
+     ax_score.invert_yaxis()
+
+     # 整体标题
+     fig.suptitle("Region sub-scores and contributions", fontsize=14, y=0.98, color=TEXT_COLOR)
+
+     # 去边框
+     for ax in [ax_score, ax_contrib]:
+         for spine in ["top", "right", "left", "bottom"]:
+             ax.spines[spine].set_visible(False)
+
+     plt.tight_layout(rect=[0, 0, 1, 0.95])
+     # 同时保存 SVG 和 PNG 两份
+     p = Path(save_path)
+     stem_dir = str(p.with_suffix(""))
+     plt.savefig(stem_dir + ".svg", format="svg", bbox_inches="tight", facecolor=fig.get_facecolor())
+     plt.savefig(stem_dir + ".png", format="png", dpi=200, bbox_inches="tight", facecolor=fig.get_facecolor())
+     plt.close(fig)
+
+
+def save_mask_overlay_visualization(
+    image_path: str,
+    semantic_mask: torch.Tensor,
+    region_names: Sequence[str],
+    save_path: str,
+    conf_threshold: float = 0.55,
+    min_area_ratio: float = 0.002,
+) -> None:
+    """保存离线 semantic_mask 的可视化图。"""
+    image = load_raw_image(image_path).astype(np.float32) / 255.0
+    h, w = image.shape[:2]
+
+    mask = semantic_mask.detach().cpu()
+    if mask.ndim == 3:
+        mask = mask[0]
+    if mask.ndim != 2:
+        raise ValueError(f"Expected semantic_mask to be [H,W] or [1,H,W], got {tuple(mask.shape)}")
+
+    if mask.shape != (h, w):
+        raise ValueError(f"semantic_mask shape {tuple(mask.shape)} != image shape {(h, w)}")
+
+    label_np = mask.numpy().astype(np.int64)
+    total = float(h * w)
+
+    overlay = image.copy()
+    legend_handles = []
+
+    def _mask_edge(binary_mask: np.ndarray) -> np.ndarray:
+        padded = np.pad(binary_mask.astype(np.uint8), 1, mode="constant")
+        center = padded[1:-1, 1:-1]
+        neighbors = (
+            padded[:-2, 1:-1] & padded[2:, 1:-1] &
+            padded[1:-1, :-2] & padded[1:-1, 2:]
+        )
+        return center.astype(bool) & (~neighbors.astype(bool))
+
+    edge_canvas = np.zeros((h, w, 3), dtype=np.float32)
+    edge_alpha = np.zeros((h, w, 1), dtype=np.float32)
+
+    for ridx, region_name in enumerate(region_names):
+        hard_region = label_np == ridx
+        if not np.any(hard_region):
+            continue
+
+        area = float(hard_region.sum() / max(total, 1.0))
+        if area < min_area_ratio:
+            continue
+
+        rgb = np.array(_hex_to_rgb01(MASK_PALETTE.get(region_name, "#C7D2DA")), dtype=np.float32)
+        overlay[hard_region] = overlay[hard_region] * (1.0 - MASK_ALPHA) + rgb * MASK_ALPHA
+
+        edge_mask = _mask_edge(hard_region)
+        edge_rgb = np.clip(rgb * 0.72, 0.0, 1.0)
+        edge_canvas[edge_mask] = edge_rgb
+        edge_alpha[edge_mask] = MASK_EDGE_ALPHA
+
+        legend_handles.append((region_name, rgb, area))
+
+    overlay = overlay * (1.0 - edge_alpha) + edge_canvas * edge_alpha
+
+    fig = plt.figure(figsize=(12.6, 6.5), facecolor=COLOR_FIG)
+    gs = fig.add_gridspec(1, 2, width_ratios=[1.0, 1.0], wspace=0.03)
+    ax0 = fig.add_subplot(gs[0, 0])
+    ax1 = fig.add_subplot(gs[0, 1])
+
+    for ax in (ax0, ax1):
+        ax.set_facecolor(FIG_BG)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+
+    ax0.imshow(image)
+    ax0.set_title("Original image", fontsize=13, pad=10, color=TEXT_COLOR)
+
+    ax1.imshow(overlay)
+    ax1.set_title("Semantic region overlay (alpha=0.80)", fontsize=13, pad=10, color=TEXT_COLOR)
+
+    legend_handles = sorted(legend_handles, key=lambda x: x[2], reverse=True)
+    if legend_handles:
+        import matplotlib.patches as mpatches
+        patches = [
+            mpatches.Patch(color=rgb, label=f"{region_display_name_en(name)} ({area:.1%})", alpha=MASK_ALPHA)
+            for name, rgb, area in legend_handles
+        ]
+        fig.legend(
+            handles=patches,
+            loc="lower center",
+            ncol=min(4, max(1, len(patches))),
+            frameon=False,
+            fontsize=10,
+            bbox_to_anchor=(0.5, -0.02),
+            columnspacing=1.4,
+            handlelength=1.3,
+        )
+
+    fig.suptitle("Original image and semantic region overlay", fontsize=15, y=0.98, color=TEXT_COLOR)
+    plt.tight_layout(rect=[0, 0.06, 1, 0.95])
+    # 同时保存 SVG 和 PNG 两份
+    p = Path(save_path)
+    stem_dir = str(p.with_suffix(""))
+    # PNG：真实像素图像，存 PNG 速度快、文件小
+    plt.savefig(stem_dir + ".png", format="png", dpi=160, bbox_inches="tight", facecolor=fig.get_facecolor())
+    # SVG：会把真实图像编码为 base64，文件较大，但矢量部分可缩放
+    plt.savefig(stem_dir + ".svg", format="svg", bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+
+
+# =========================================================
+# 辅助输出
+# =========================================================
+def print_reason_block(title: str, items: List[Dict[str, Any]]) -> None:
+    print(f"\n{title}")
+    if items:
+        for x in items:
+            print(f"  - {x['feature_display_name']}: value={x['feature_value']:.3f}, SHAP{x['shap_value']:+.3f}")
+    else:
+        print("  - 无")
+
+
+def explain_single_sample_and_plot(
+    *,
+    model,
+    outputs: Dict[str, torch.Tensor],
+    bg_global: torch.Tensor,
+    bg_region: torch.Tensor,
+    region_names: Sequence[str],
+    global_feature_names: Sequence[str],
+    region_feature_names: Sequence[str],
+    manual_forward_fn,
+    save_dir: str,
+    image_path: Optional[str] = None,
+    semantic_mask: Optional[torch.Tensor] = None,
+    conf_threshold: float = 0.55,
+    min_area_ratio: float = 0.002,
+    defect_threshold: float = 6.0,
+    advantage_threshold: float = 7.5,
+) -> Dict[str, Any]:
+    _ensure_dir(save_dir)
+    visual_detected_mask = visual_area_ratio = visual_peak_conf = None
+    if outputs.get("image_region_soft_masks") is not None:
+        visual_detected_mask, visual_area_ratio, visual_peak_conf = compute_visual_region_stats(
+            outputs["image_region_soft_masks"], conf_threshold=conf_threshold, min_area_ratio=min_area_ratio
+        )
+        visual_detected_mask = visual_detected_mask.unsqueeze(0)
+        visual_area_ratio = visual_area_ratio.unsqueeze(0)
+        visual_peak_conf = visual_peak_conf.unsqueeze(0)
+
+    engine = ExplainabilityEngineStrictOriginalDesign(
+        region_names=region_names,
+        global_feature_names=global_feature_names,
+        region_feature_names=region_feature_names,
+        manual_forward_fn=manual_forward_fn,
+    )
+    result = engine.explain(
+        model=model,
+        outputs=outputs,
+        bg_global=bg_global,
+        bg_region=bg_region,
+        visual_detected_mask=visual_detected_mask,
+        visual_area_ratio=visual_area_ratio,
+        visual_peak_conf=visual_peak_conf,
+        defect_threshold=defect_threshold,
+        advantage_threshold=advantage_threshold,
+    )
+
+    if image_path and semantic_mask is not None:
+        try:
+            save_mask_overlay_visualization(
+                image_path=image_path,
+                semantic_mask=semantic_mask,
+                region_names=region_names,
+                save_path=os.path.join(save_dir, "semantic_mask_overlay.svg"),
+                conf_threshold=conf_threshold,
+                min_area_ratio=min_area_ratio,
+            )
+        except Exception as exc:
+            print(f"[warn] failed to save semantic_mask_overlay.svg: {exc}")
+
+    try:
+        save_single_sample_waterfall(result, os.path.join(save_dir, "shap_waterfall.svg"), max_display=15)
+    except Exception as exc:
+        print(f"[warn] failed to save shap_waterfall.svg: {exc}")
+
+    all_region_items = result["region_positive_features_flat"] + result["region_negative_features_flat"]
+    save_local_bar_pretty(
+        all_region_items,
+        "Top region-related SHAP features for predicted image score",
+        os.path.join(save_dir, "region_local_bar.svg"),
+        top_k=12,
+    )
+    all_global_items = result["global_positive_features"] + result["global_negative_features"]
+    save_local_bar_pretty(
+        all_global_items,
+        "Top global SHAP features for predicted image score",
+        os.path.join(save_dir, "global_local_bar.svg"),
+        top_k=10,
+    )
+    save_region_overview(result["region_explanations"], os.path.join(save_dir, "region_overview.svg"), defect_threshold=defect_threshold)
+    save_region_feature_heatmap(
+        result,
+        region_names=region_names,
+        region_feature_names=region_feature_names,
+        save_path=os.path.join(save_dir, "region_feature_heatmap.svg"),
+        use_abs=True,
+    )
+
+    for region_item in result["region_explanations"]:
+        if not region_item["is_defect"]:
+            continue
+        lowest_items = region_item.get("lowest_features", [])
+        if len(lowest_items) == 0:
+            continue
+        save_region_low_value_bar(
+            lowest_items,
+            title=f"{region_display_name_en(region_item['region_name'])} defect features (lowest raw values)",
+            save_path=os.path.join(save_dir, f"defect_region_{region_item['region_name']}_bar.svg"),
+            top_k=8,
+        )
+    return result
+
+
+# =========================================================
+# main
+# =========================================================
+def main() -> None:
+    parser = argparse.ArgumentParser(description="单样本解释脚本（严格按原始设计输出区域子评分与区域贡献图）")
+    parser.add_argument("--image", type=str, required=True, help="待解释图片路径")
+    parser.add_argument("--checkpoint", type=str, required=True, help="模型 checkpoint 路径")
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="/root/autodl-tmp/pythonProject2/Shap_analysis/outcomes",
+        help="输出目录",
+    )
+    parser.add_argument("--background-cache", type=str, default="", help="SHAP background 缓存路径")
+    parser.add_argument("--background-size", type=int, default=64, help="background 样本数")
+    parser.add_argument("--search-splits", type=str, default="test,val,train", help="查找图片所在 split")
+    parser.add_argument("--conf-threshold", type=float, default=0.55, help="视觉检测置信度阈值（仅展示用）")
+    parser.add_argument("--min-area-ratio", type=float, default=0.002, help="最小区域面积占比阈值（仅展示用）")
+    parser.add_argument("--defect-threshold", type=float, default=6.0, help="缺陷区域阈值")
+    parser.add_argument("--advantage-threshold", type=float, default=7.5, help="优势区域阈值")
+    parser.add_argument("--use-online-seg", action="store_true", help="是否在线分割")
+    args = parser.parse_args()
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    search_splits = [s.strip() for s in args.search_splits.split(",") if s.strip()]
+
+    print("=" * 100)
+    print("开始单样本解释（严格按原始设计输出区域子评分与区域贡献）")
+    print("=" * 100)
+    print(f"图片: {args.image}")
+    print(f"checkpoint: {args.checkpoint}")
+    print(f"输出目录: {args.output_dir}")
+    print(f"设备: {device}")
+    print(f"search_splits: {search_splits}")
+
+    model = build_model(args.checkpoint, device)
+    sample_inputs, found_split = load_sample_inputs(args.image, device, search_splits, use_online_seg=args.use_online_seg)
+    outputs = run_model_forward(model, sample_inputs)
+    outputs["raw_handcrafted_global"] = sample_inputs["handcrafted_global"]
+    outputs["raw_handcrafted_region"] = sample_inputs["handcrafted_region"]
+
+    bg_global, bg_region = build_background(args.background_cache if args.background_cache else None, max_samples=args.background_size)
+
+    result = explain_single_sample_and_plot(
+        model=model,
+        outputs=outputs,
+        bg_global=bg_global,
+        bg_region=bg_region,
+        region_names=resolve_region_names(),
+        global_feature_names=resolve_global_feature_names(),
+        region_feature_names=resolve_region_feature_names(),
+        manual_forward_fn=manual_forward_from_intermediate_features,
+        save_dir=args.output_dir,
+        image_path=args.image,
+        semantic_mask=sample_inputs["seg_masks"],
+        conf_threshold=args.conf_threshold,
+        min_area_ratio=args.min_area_ratio,
+        defect_threshold=args.defect_threshold,
+        advantage_threshold=args.advantage_threshold,
+    )
+
+    stem = os.path.splitext(os.path.basename(args.image))[0]
+    json_path = os.path.join(args.output_dir, f"{stem}_explainability_original_design.json")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "image": args.image,
+                "dataset_split": found_split,
+                "use_online_seg": args.use_online_seg,
+                "checkpoint": args.checkpoint,
+                "conf_threshold": args.conf_threshold,
+                "min_area_ratio": args.min_area_ratio,
+                "region_contribution_definition": "alpha_r * (s_r - 0.5)",
+                **result,
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    print("=" * 100)
+    print("解释完成")
+    print("=" * 100)
+    print(f"匹配 split: {found_split}")
+    print(f"整图最终评分: {result['final_score_10']:.4f}/10")
+    print(f"SHAP 方法: {result['shap_method']}")
+    print(f"解释摘要: {result['summary']}")
+
+    print("\n检测到的区域及其区域贡献（按原始设计定义，仅展示，不改变评分）：")
+    if result["visual_detected_region_contributions"]:
+        for item in sorted(result["visual_detected_region_contributions"], key=lambda x: abs(x["region_contribution_score"]), reverse=True):
+            score_text = "N/A" if item["region_score_10"] is None or np.isnan(item["region_score_10"]) else f"{item['region_score_10']:.2f}/10"
+            print(
+                f"  - {item['region_display_name']}: 面积占比 {item['area_ratio']:.3%}, 峰值置信度 {item['peak_confidence']:.3f}, "
+                f"子评分 {score_text}, 区域贡献 {item['region_contribution_score']:+.3f}, 区域权重 {item['region_weight']:.3f}"
+            )
+    else:
+        print("  - 无")
+
+    print("\n参与评分的有效区域及其区域贡献（按原始设计定义）：")
+    if result["valid_region_contributions"]:
+        for item in sorted(result["valid_region_contributions"], key=lambda x: abs(x["region_contribution_score"]), reverse=True):
+            score_text = "N/A" if item["region_score_10"] is None or np.isnan(item["region_score_10"]) else f"{item['region_score_10']:.2f}/10"
+            print(
+                f"  - {item['region_display_name']}: 面积占比 {item['area_ratio']:.3%}, 峰值置信度 {item['peak_confidence']:.3f}, "
+                f"子评分 {score_text}, 区域贡献 {item['region_contribution_score']:+.3f}, 区域权重 {item['region_weight']:.3f}, "
+                f"区域级SHAP归因 {item['region_shap_attribution_score']:+.3f}"
+            )
+    else:
+        print("  - 无")
+
+    print_reason_block("全局特征 SHAP 归因（高分原因）:", result["global_positive_features"][:5])
+    print_reason_block("全局特征 SHAP 归因（低分原因）:", result["global_negative_features"][:5])
+    print_reason_block("区域特征 SHAP 归因（高分原因）:", result["region_positive_features_flat"][:5])
+    print_reason_block("区域特征 SHAP 归因（低分原因）:", result["region_negative_features_flat"][:5])
+
+    print("\n输出文件 (每类图都同时保存 .svg 矢量版 + .png 位图版):")
+    print(f"  - {os.path.join(args.output_dir, 'semantic_mask_overlay')}.{{svg,png}}  # Original image + semantic mask overlay")
+    print(f"  - {os.path.join(args.output_dir, 'shap_waterfall')}.{{svg,png}}           # SHAP waterfall breakdown")
+    print(f"  - {os.path.join(args.output_dir, 'region_overview')}.{{svg,png}}           # Region sub-scores and contributions")
+    print(f"  - {os.path.join(args.output_dir, 'global_local_bar')}.{{svg,png}}          # Global SHAP bar")
+    print(f"  - {os.path.join(args.output_dir, 'region_local_bar')}.{{svg,png}}          # Region-feature SHAP bar")
+    print(f"  - {os.path.join(args.output_dir, 'region_feature_heatmap')}.{{svg,png}}   # Region-feature SHAP heatmap")
+    print(f"  - {json_path}  # Structured explanation JSON")
+    print("=" * 100)
+
+
+if __name__ == "__main__":
+    main()
